@@ -1,7 +1,5 @@
 streamlit
-ultralytics
-sahi
-opencv-python-headless
+yolov5
 pillow
 torch
 torchvision
