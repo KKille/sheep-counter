@@ -3,3 +3,4 @@ yolov5
 pillow
 torch
 torchvision
+setuptools<82
