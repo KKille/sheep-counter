@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import io
 import os
+import math
 
 st.set_page_config(page_title="Paddock Sheep Counter", page_icon="logo.png", layout="wide")
 
@@ -39,6 +40,11 @@ st.markdown("""
     }
     div[data-testid="stImage"] img {
         border-radius: 10px;
+    }
+    .crop-caption {
+        text-align: center;
+        font-size: 0.8rem;
+        color: #6B7A6E;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -86,18 +92,20 @@ model.conf = conf_threshold
 model.iou = iou_threshold
 
 
-def get_font(size=16):
-    try:
-        return ImageFont.truetype("DejaVuSans-Bold.ttf", size)
-    except Exception:
-        return ImageFont.load_default()
+def compute_line_width(predictions):
+    """Scale outline thickness to how big the sheep actually are in this photo."""
+    if len(predictions) == 0:
+        return 1
+    boxes = predictions.tolist()
+    avg_size = sum((b[2] - b[0] + b[3] - b[1]) / 2 for b in boxes) / len(boxes)
+    return 1 if avg_size < 45 else (2 if avg_size < 90 else 3)
 
 
-def draw_clean_boxes(image, predictions, review_cutoff):
-    """Draw boxes with small numbered tags instead of overlapping 'sheep 0.88' text."""
+def draw_outline_only(image, predictions, review_cutoff):
+    """Draw thin outlines only, no text — avoids label overlap in dense clusters."""
     img = image.copy()
     draw = ImageDraw.Draw(img)
-    font = get_font(16)
+    line_width = compute_line_width(predictions)
 
     detections = []
     for i, (*box, conf, cls) in enumerate(predictions.tolist(), start=1):
@@ -105,20 +113,27 @@ def draw_clean_boxes(image, predictions, review_cutoff):
         conf = float(conf)
         needs_review = conf < review_cutoff
         color = (230, 126, 34) if needs_review else (39, 116, 79)  # orange vs green
-
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-
-        label = str(i)
-        text_bbox = draw.textbbox((0, 0), label, font=font)
-        tw, th = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
-        pad = 3
-        tag_y = y1 - th - 2 * pad if y1 - th - 2 * pad > 0 else y1
-        draw.rectangle([x1, tag_y, x1 + tw + 2 * pad, tag_y + th + 2 * pad], fill=color)
-        draw.text((x1 + pad, tag_y + pad), label, fill="white", font=font)
-
-        detections.append({"#": i, "confidence": round(conf, 2), "review": "⚠️ check" if needs_review else "✅"})
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=line_width)
+        detections.append({"#": i, "confidence": round(conf, 2), "review": "⚠️ check" if needs_review else "✅",
+                            "box": (x1, y1, x2, y2)})
 
     return img, detections
+
+
+def crop_detection(image, box, pad_ratio=0.6, min_size=60):
+    """Crop a padded, isolated thumbnail around a single detection for the review gallery."""
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    pad_x, pad_y = w * pad_ratio, h * pad_ratio
+    left = max(0, int(x1 - pad_x))
+    top = max(0, int(y1 - pad_y))
+    right = min(image.width, int(x2 + pad_x))
+    bottom = min(image.height, int(y2 + pad_y))
+    crop = image.crop((left, top, right, bottom))
+    if crop.width < min_size or crop.height < min_size:
+        scale = min_size / max(crop.width, crop.height, 1)
+        crop = crop.resize((max(1, int(crop.width * scale)), max(1, int(crop.height * scale))))
+    return crop
 
 
 # 3. File uploader & Processing
@@ -134,31 +149,48 @@ if uploaded_file is not None:
         predictions = results.pred[0]  # tensor: x1,y1,x2,y2,conf,cls
         sheep_count = len(predictions)
 
-        annotated_image, detections = draw_clean_boxes(input_image, predictions, review_cutoff)
-        flagged_count = sum(1 for d in detections if d["review"] != "✅")
+        annotated_image, detections = draw_outline_only(input_image, predictions, review_cutoff)
+        flagged = [d for d in detections if d["review"] != "✅"]
+        flagged.sort(key=lambda d: d["confidence"])
 
     st.write("")
     metric_col1, metric_col2, metric_col3 = st.columns(3)
     metric_col1.metric("Sheep detected", sheep_count)
-    metric_col2.metric("Flagged for review", flagged_count)
+    metric_col2.metric("Flagged for review", len(flagged))
     metric_col3.metric("Confidence threshold", f"{conf_threshold:.0%}")
 
     st.write("")
-    col1, col2 = st.columns([3, 1])
+    st.image(annotated_image, caption=f"Processed Image ({sheep_count} Sheep Outlined) — orange = worth a second look",
+              use_container_width=True)
 
-    with col1:
-        st.image(annotated_image, caption=f"Processed Image ({sheep_count} Sheep Outlined)", use_container_width=True)
+    buf = io.BytesIO()
+    annotated_image.save(buf, format="PNG")
+    st.download_button("⬇️ Download annotated image (full resolution)", data=buf.getvalue(),
+                        file_name="sheep_count_annotated.png", mime="image/png")
+    st.caption("Download the full-res image to zoom in properly — the preview above is scaled down to fit the page.")
 
-        buf = io.BytesIO()
-        annotated_image.save(buf, format="PNG")
-        st.download_button("⬇️ Download annotated image", data=buf.getvalue(),
-                            file_name="sheep_count_annotated.png", mime="image/png")
+    st.divider()
 
-    with col2:
-        st.subheader("Review list")
-        st.caption("Lowest confidence first — check these against the photo.")
-        sorted_detections = sorted(detections, key=lambda d: d["confidence"])
-        st.dataframe(sorted_detections, use_container_width=True, hide_index=True)
+    if flagged:
+        st.subheader(f"⚠️ Review gallery — {len(flagged)} flagged detection(s)")
+        st.caption("Each tile is a zoomed-in crop of one flagged detection, lowest confidence first. No overlapping labels — just look through and confirm.")
+
+        show_all = st.checkbox("Show all flagged crops (can be a lot on dense photos)", value=len(flagged) <= 40)
+        display_list = flagged if show_all else flagged[:40]
+        if not show_all and len(flagged) > 40:
+            st.caption(f"Showing the 40 lowest-confidence detections. Tick the box above to see all {len(flagged)}.")
+
+        cols_per_row = 8
+        for row_start in range(0, len(display_list), cols_per_row):
+            row_items = display_list[row_start:row_start + cols_per_row]
+            cols = st.columns(cols_per_row)
+            for col, d in zip(cols, row_items):
+                crop = crop_detection(input_image, d["box"])
+                with col:
+                    st.image(crop, use_container_width=True)
+                    st.markdown(f"<div class='crop-caption'>#{d['#']} · {d['confidence']:.0%}</div>", unsafe_allow_html=True)
+    else:
+        st.success("No detections flagged — everything's above your confidence threshold. 🎉")
 
     st.divider()
     final_count = st.number_input("Final count (adjust after reviewing)", min_value=0, value=sheep_count, step=1)
