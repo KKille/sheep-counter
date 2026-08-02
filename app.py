@@ -1,41 +1,38 @@
 import streamlit as st
-from sahi import AutoDetectionModel
-from sahi.predict import get_sliced_prediction
+import yolov5
 from PIL import Image
 
-st.title("🐑 Paddock Sheep Counter")
-st.write("Upload a drone photo to automatically count sheep.")
+st.set_page_config(page_title="Sheep Counter", page_icon="🐑")
+st.title("Glenfairy Sheep Counter")
+st.write("Upload an overhead drone photo to count sheep")
 
-# Load model (cached so it only loads once)
+# 1. Load the fine-tuned aerial sheep model from Hugging Face
 @st.cache_resource
-def load_model():
-    return AutoDetectionModel.from_pretrained(
-        model_type='yolov8',
-        model_path='yolov8x.pt',
-        confidence_threshold=0.25,
-        device='cpu'
-    )
+def load_aerial_model():
+    model = yolov5.load('keremberke/yolov5m-aerial-sheep')
+    model.conf = 0.25  # Confidence threshold
+    model.iou = 0.45   # Overlap threshold
+    return model
 
-model = load_model()
+model = load_aerial_model()
 
-uploaded_file = st.file_uploader("Choose a drone image...", type=["jpg", "jpeg", "png"])
+# 2. File uploader
+uploaded_file = st.file_uploader("Upload Drone Photo", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    image = Image.open(uploaded_file)
-    image.save("temp.jpg")
+    input_image = Image.open(uploaded_file)
     
-    with st.spinner("Counting sheep..."):
-        result = get_sliced_prediction(
-            "temp.jpg",
-            model,
-            slice_height=640,
-            slice_width=640,
-            overlap_height_ratio=0.2,
-            overlap_width_ratio=0.2
-        )
+    with st.spinner("Analyzing overhead image with aerial AI model..."):
+        # Run model inference on the high-res image
+        results = model(input_image, size=1280)
         
-        sheep_preds = [p for p in result.object_prediction_list if p.category.name == 'sheep']
-        result.export_visuals(export_dir="./", file_name="out")
+        # Save output image with bounding boxes drawn around every sheep
+        results.render()  # Draws boxes directly onto results.imgs
+        output_image = Image.fromarray(results.imgs[0])
         
-        st.success(f"Total Sheep Counted: {len(sheep_preds)}")
-        st.image("out.png", caption="Processed Photo with Sheep Boxed")
+        # Calculate total count from detection tensor
+        sheep_count = len(results.pred[0])
+        
+        # Show results
+        st.success(f"Total Sheep Detected: {sheep_count}")
+        st.image(output_image, caption=f"Processed Image ({sheep_count} Sheep Outlined)")
